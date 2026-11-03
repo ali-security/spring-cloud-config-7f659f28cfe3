@@ -19,17 +19,22 @@ package org.springframework.cloud.config.server.credentials;
 import java.net.URISyntaxException;
 
 import com.amazonaws.auth.AWSCredentialsProvider;
+import org.apache.commons.logging.Log;
 import org.eclipse.jgit.errors.UnsupportedCredentialItem;
 import org.eclipse.jgit.transport.CredentialItem;
 import org.eclipse.jgit.transport.URIish;
 import org.junit.Before;
 import org.junit.Test;
+import org.mockito.invocation.Invocation;
 
 import org.springframework.cloud.config.server.support.AwsCodeCommitCredentialProvider;
 import org.springframework.cloud.config.server.support.GitCredentialsProviderFactory;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.fail;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockingDetails;
 
 /**
  * It would be nice to do an integration test, however, this would require using real AWS
@@ -166,6 +171,43 @@ public class AwsCodeCommitCredentialsProviderTests {
 		assertThat(thePassword.length > 16).isTrue();
 		assertThat(thePassword[8]).isEqualTo('T');
 		assertThat(thePassword[15]).isEqualTo('Z');
+	}
+
+	@Test
+	public void testCredentialsAreNotLogged() throws URISyntaxException {
+		String accessKey = "AKIAIOSFODNN7EXAMPLE";
+		String secretKey = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+		GitCredentialsProviderFactory factory = new GitCredentialsProviderFactory();
+		this.provider = (AwsCodeCommitCredentialProvider) factory.createFor(AWS_REPO,
+				accessKey, secretKey, null, false);
+		Log log = mock(Log.class);
+		ReflectionTestUtils.setField(this.provider, "logger", log);
+
+		CredentialItem[] credentialItems = new CredentialItem[] {
+				new CredentialItem.Username(), new CredentialItem.Password(),
+				new CredentialItem.StringType("Password: ", true) };
+		assertThat(this.provider.get(new URIish(AWS_REPO), credentialItems)).isTrue();
+
+		String theUsername = ((CredentialItem.Username) credentialItems[0]).getValue();
+		String thePassword = new String(
+				((CredentialItem.Password) credentialItems[1]).getValue());
+		String thePasswordString = ((CredentialItem.StringType) credentialItems[2])
+				.getValue();
+		assertThat(theUsername).isEqualTo(accessKey);
+		assertThat(thePassword).isNotEmpty();
+		assertThat(thePasswordString).isEqualTo(thePassword);
+
+		int traceCalls = 0;
+		for (Invocation invocation : mockingDetails(log).getInvocations()) {
+			if ("trace".equals(invocation.getMethod().getName())) {
+				traceCalls++;
+			}
+			for (Object argument : invocation.getArguments()) {
+				assertThat(String.valueOf(argument)).doesNotContain(accessKey)
+						.doesNotContain(secretKey).doesNotContain(thePassword);
+			}
+		}
+		assertThat(traceCalls).isEqualTo(3);
 	}
 
 	private CredentialItem[] makeCredentialItems() {
