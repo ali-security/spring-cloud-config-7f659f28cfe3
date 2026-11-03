@@ -1,0 +1,103 @@
+# Authored for the ali-security fork: upstream spring-cloud-config 2.2.x has no
+# GitHub Actions CI (only .circleci/config.yml). This mirrors the CircleCI build
+# command (./mvnw clean install over the whole reactor on JDK 8) and uploads the
+# spring-cloud-config-server jars.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 48
+    env:
+      _JAVA_OPTIONS: "-Xms1024m -Xmx2048m"
+      TERM: dumb
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+
+      - name: Drop repo.spring.io profile from .mvn/maven.config
+        # The shipped maven.config activates -P spring (repo.spring.io, which no
+        # longer serves anonymous requests); every dependency is on Maven Central.
+        run: ": > .mvn/maven.config"
+
+      - name: Build and test (full reactor)
+        if: ${{ inputs.test-filter == '' }}
+        run: >
+          ./mvnw -B -e -V -nsu
+          -Dmaven.test.redirectTestOutputToFile=true
+          -Dmaven.javadoc.skip=true -Dgpg.skip=true
+          clean install
+
+      - name: Build and test (filtered)
+        if: ${{ inputs.test-filter != '' }}
+        run: >
+          ./mvnw -B -e -V -nsu
+          -Dmaven.test.redirectTestOutputToFile=true
+          -Dmaven.javadoc.skip=true -Dgpg.skip=true
+          -Dtest='${{ inputs.test-filter }}'
+          -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false
+          clean install
+
+      - name: Test summary
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, os, re, xml.etree.ElementTree as ET
+          tot = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          per = {}
+          skips = []
+          for f in sorted(glob.glob("**/target/surefire-reports/TEST-*.xml", recursive=True)):
+              mod = f.split("/target/")[0]
+              r = ET.parse(f).getroot()
+              m = per.setdefault(mod, {"tests": 0, "failures": 0, "errors": 0, "skipped": 0})
+              for k in tot:
+                  v = int(r.get(k, 0) or 0)
+                  m[k] += v
+                  tot[k] += v
+              for tc in r.findall("testcase"):
+                  s = tc.find("skipped")
+                  if s is None:
+                      continue
+                  msg = (s.get("message") or "").strip()
+                  if not msg:
+                      cls = tc.get("classname", "")
+                      src = os.path.join(mod, "src/test/java", cls.replace(".", "/") + ".java")
+                      if os.path.exists(src):
+                          lines = open(src, encoding="utf-8").read().splitlines()
+                          for i, line in enumerate(lines):
+                              if re.search(r"\b%s\s*\(" % re.escape(tc.get("name", "")), line):
+                                  for j in range(max(0, i - 4), i):
+                                      if "@Ignore" in lines[j]:
+                                          msg = "source: " + lines[j].strip()
+                                  break
+                  skips.append("%s.%s: %s" % (tc.get("classname"), tc.get("name"), msg or "(no message)"))
+          for mod, m in per.items():
+              print("MODULE %-45s tests=%d passed=%d failures=%d errors=%d skipped=%d" % (
+                  mod, m["tests"], m["tests"] - m["failures"] - m["errors"] - m["skipped"],
+                  m["failures"], m["errors"], m["skipped"]))
+          print("TOTAL tests=%d passed=%d failures=%d errors=%d skipped=%d" % (
+              tot["tests"], tot["tests"] - tot["failures"] - tot["errors"] - tot["skipped"],
+              tot["failures"], tot["errors"], tot["skipped"]))
+          for s in skips:
+              print("SKIPPED " + s)
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spring-cloud-config-server-jars
+          path: |
+            spring-cloud-config-server/target/spring-cloud-config-server-2.2.6.RELEASE.jar
+            spring-cloud-config-server/target/spring-cloud-config-server-2.2.6.RELEASE-tests.jar
+          if-no-files-found: error
