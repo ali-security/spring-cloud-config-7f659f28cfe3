@@ -18,6 +18,10 @@ package org.springframework.cloud.config.server.environment;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -60,6 +64,7 @@ import org.eclipse.jgit.transport.URIish;
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
 import org.eclipse.jgit.util.FileUtils;
 import org.eclipse.jgit.util.SystemReader;
+import org.junit.Assume;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Rule;
@@ -73,9 +78,12 @@ import org.springframework.cloud.config.server.support.GitSkipSslValidationCrede
 import org.springframework.cloud.config.server.support.PassphraseCredentialsProvider;
 import org.springframework.cloud.config.server.test.ConfigServerTestUtils;
 import org.springframework.core.env.StandardEnvironment;
+import org.springframework.core.io.UrlResource;
+import org.springframework.util.StringUtils;
 
 import static junit.framework.TestCase.assertTrue;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -127,6 +135,129 @@ public class JGitEnvironmentRepositoryTests {
 		assertThat(environment.getPropertySources().get(0).getName())
 				.isEqualTo(this.repository.getUri() + "/bar.properties");
 		assertVersion(environment);
+	}
+
+	@Test
+	public void fileUriRejectsRepositoryWhenResolvedPathUsesSymlinkFinalComponent() throws Exception {
+		String realUri = ConfigServerTestUtils.prepareLocalRepo("another-config-repo");
+		File realDir = new UrlResource(StringUtils.cleanPath(realUri)).getFile();
+		Path realPath = realDir.toPath().toAbsolutePath().normalize();
+		Path parent = realPath.getParent();
+		Assume.assumeTrue(parent != null);
+		Path link = parent.resolve("another-config-repo-symlink-link");
+		try {
+			Files.deleteIfExists(link);
+			Files.createSymbolicLink(link, realPath);
+		}
+		catch (IOException | UnsupportedOperationException | SecurityException ex) {
+			Assume.assumeNoException(
+						"Cannot create symbolic link for test: " + ex.getMessage(), ex);
+		}
+		try {
+			this.repository.setUri(link.toUri().toString());
+			this.repository.setBasedir(this.basedir);
+			assertThatThrownBy(() -> this.repository.findOne("bar", "staging", "master"))
+				.isInstanceOf(IllegalStateException.class)
+				.hasMessageContaining("Cannot load environment")
+				.hasCauseInstanceOf(IllegalStateException.class)
+				.satisfies(ex -> assertThat(ex.getCause())
+						.hasMessageContaining("symbolic link"));
+		}
+		finally {
+			Files.deleteIfExists(link);
+		}
+	}
+
+	@Test
+	public void fileUriRejectsDotGitAsSymbolicLink() throws Exception {
+		String realUri = ConfigServerTestUtils.prepareLocalRepo("test2-config-repo");
+		File realDir = new UrlResource(StringUtils.cleanPath(realUri)).getFile();
+		Path repoRoot = realDir.toPath().toAbsolutePath().normalize();
+		Path gitPath = repoRoot.resolve(".git");
+		Path backup = repoRoot.resolve(".git-backup-for-symlink-test");
+		Files.deleteIfExists(backup);
+		try {
+			try {
+				Files.move(gitPath, backup, StandardCopyOption.ATOMIC_MOVE);
+			}
+			catch (AtomicMoveNotSupportedException ex) {
+				Files.move(gitPath, backup, StandardCopyOption.REPLACE_EXISTING);
+			}
+			try {
+				Files.createSymbolicLink(gitPath, backup);
+			}
+			catch (IOException | UnsupportedOperationException | SecurityException ex) {
+				Assume.assumeNoException(
+						"Cannot create symbolic link for test: " + ex.getMessage(), ex);
+			}
+			this.repository.setUri(realUri);
+			this.repository.setBasedir(this.basedir);
+			assertThatThrownBy(() -> this.repository.findOne("bar", "staging", "master"))
+				.isInstanceOf(IllegalStateException.class)
+				.hasMessageContaining("Cannot load environment")
+				.hasCauseInstanceOf(IllegalStateException.class)
+				.satisfies(ex -> assertThat(ex.getCause())
+						.hasMessageContaining("symbolic link")
+						.hasMessageContaining(".git"));
+		}
+		finally {
+			Files.deleteIfExists(gitPath);
+			if (Files.exists(backup)) {
+				try {
+					Files.move(backup, gitPath, StandardCopyOption.REPLACE_EXISTING);
+				}
+				catch (IOException ex) {
+					// best-effort restore for other tests using the same fixture path
+				}
+			}
+		}
+	}
+
+	@Test
+	public void cloneDoesNotFollowBasedirSymbolicLink() throws Exception {
+		Path basedirPath = this.basedir.toPath().toAbsolutePath().normalize();
+		Path outside = new File("target/basedir-symlink-target").toPath()
+				.toAbsolutePath().normalize();
+		if (Files.exists(outside)) {
+			FileUtils.delete(outside.toFile(), FileUtils.RECURSIVE | FileUtils.RETRY);
+		}
+		Files.createDirectories(outside);
+		Path sentinel = Files.createFile(outside.resolve("sentinel.txt"));
+		Files.createDirectories(basedirPath.getParent());
+		try {
+			Files.createSymbolicLink(basedirPath, outside);
+		}
+		catch (IOException | UnsupportedOperationException | SecurityException ex) {
+			Assume.assumeNoException(
+					"Cannot create symbolic link for test: " + ex.getMessage(), ex);
+		}
+		try {
+			Git mockGit = mock(Git.class);
+			CloneCommand mockCloneCommand = mock(CloneCommand.class);
+			when(mockCloneCommand.setURI(anyString())).thenReturn(mockCloneCommand);
+			when(mockCloneCommand.setDirectory(any(File.class)))
+					.thenReturn(mockCloneCommand);
+			when(mockCloneCommand.call()).thenReturn(mockGit);
+
+			JGitEnvironmentRepository envRepository = new JGitEnvironmentRepository(
+					this.environment, new JGitEnvironmentProperties());
+			envRepository.setGitFactory(new MockGitFactory(mockGit, mockCloneCommand));
+			envRepository.setUri("http://somegitserver/somegitrepo");
+			envRepository.setBasedir(this.basedir);
+			envRepository.setCloneOnStart(true);
+			envRepository.afterPropertiesSet();
+
+			assertThat(Files.exists(sentinel))
+					.as("clone must not delete the contents of a symlinked basedir target")
+					.isTrue();
+			assertThat(Files.isSymbolicLink(basedirPath)).isFalse();
+			assertThat(Files.isDirectory(basedirPath)).isTrue();
+			verify(mockCloneCommand).call();
+		}
+		finally {
+			Files.deleteIfExists(sentinel);
+			Files.deleteIfExists(outside);
+		}
 	}
 
 	@Test
