@@ -33,6 +33,7 @@ import org.springframework.cloud.config.server.test.ConfigServerTestUtils;
 import org.springframework.core.env.StandardEnvironment;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * @author Dave Syer
@@ -119,6 +120,15 @@ public class MultipleJGitEnvironmentApplicationPlaceholderRepositoryTests {
 				.isEqualTo(getUri("*").replace("{application}", "test2-config-repo")
 						+ "/application.properties");
 		assertVersion(environment);
+	}
+
+	@Test
+	public void invalidAuthorityTests() {
+		assertThatThrownBy(() -> createRepository("test", "*-config-repo", "http://{profile}:8080/test1-config-repo"))
+			.isInstanceOf(IllegalArgumentException.class);
+		assertThatThrownBy(
+				() -> createRepository("test", "*-config-repo", "http://localhost:{profile}/test1-config-repo"))
+			.isInstanceOf(IllegalStateException.class);
 	}
 
 	@Test
